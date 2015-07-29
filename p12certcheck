@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+## 
+## p12certcheck
+##
+## Copyright (C) 2015 Michael Vosseller <michael.vosseller@gmail.com>
+##
+## This program checks the expiration date of a certificate embedded within 
+## a .p12 file and prints a message about the status.
+##
+## I use this script in a nightly cronjob to warn me when my Apple Push 
+## Notification certificates are nearing expiration.
+##
+## Quiet mode (-q) is especially useful when run from cronjobs because it will 
+## only produce output if the certificate is expiring soon (within 14 days) or 
+## has already expired.
+##
+## This script requires the GNU date utility. On MAC this can be installed
+## with brew via 'brew install coreutils'
+##
+
+quiet_mode=false
+debug_mode=false
+
+function print_usage_and_exit {
+    echo "USAGE: $0 [-qd] file.p12 password"
+    exit -1
+}
+
+## extract the command line arguments
+## option parsing could be improved. ;-)
+for var in "$@"
+do
+    if [ "$var" == "-q" ]; then
+        quiet_mode=true
+    elif  [ "$var" == "-d" ]; then
+        debug_mode=true
+    elif [ "$var" == "-dq" ] || [ "$var" == "-qd" ]; then
+        quiet_mode=true
+        debug_mode=true
+    elif [ -z "$p12_file" ]; then
+        p12_file=$var
+    elif [ -z "$p12_password" ]; then
+        p12_password=$var
+    else 
+        print_usage_and_exit
+    fi
+done
+
+## ensure required arguments were set
+if [ -z "$p12_file" ] || [ -z "$p12_password" ]; then
+    print_usage_and_exit
+fi
+
+## check if running on a MAC
+if [ "$(uname)" == "Darwin" ]; then
+    is_mac=true
+else
+    is_mac=false
+fi
+
+## set the name of the GNU date binary
+if [ "$is_mac" = true ]; then 
+    GDATE_BIN="gdate"
+else
+    GDATE_BIN="date"
+fi
+
+## ensure the GNU date binary is in our path
+path_to_gdate=$(which $GDATE_BIN)
+if [ -z "$path_to_gdate" ] ; then
+    echo "Could not find GNU date binary '$GDATE_BIN' in your path."
+    if [ "$is_mac" = true ]; then 
+        echo "You can install '$GDATE_BIN' by running 'brew install coreutils'"
+    fi
+    exit -1
+fi
+
+## openssl-pkcs12 has a bug where it prints "MAC verified OK" to stderr even 
+## when no error occurs so we redirect stderr from it to a temp file, strip that 
+## message away and then print anything that remains back to stderr.
+## The reason we do this is because while running in a cronjob we don't want
+## any output unless a true error occurs or the cert is expired / expiring soon.
+
+## create a temp file to send stderr to and use trap to ensure we delete it on exit
+stderr_tmp_file=$(mktemp /tmp/$(basename $0).XXXXXX)
+trap "rm -f $stderr_tmp_file" 0 2 3 15
+
+## extract the expiration date/time from the certificate
+expiration_time_gmt_str=$(openssl pkcs12 -in $p12_file -passin pass:$p12_password -nodes 2>>$stderr_tmp_file | openssl x509 -noout -enddate | sed -e 's/notAfter=//g')
+
+## see if openssl-pkcs12 printed anything to stderr besides "MAC verified OK"
+stderrContent=$(cat $stderr_tmp_file | sed 's/MAC verified OK//g')
+if [ "$stderrContent" ]; then
+    >&2 echo $stderrContent
+    exit -1
+fi
+
+## now perform all the date and time calculations
+expiration_time_local_str=$($GDATE_BIN --date="$expiration_time_gmt_str")
+expiration_time_unix=$($GDATE_BIN --date="$expiration_time_local_str" +%s)
+expiration_date=$($GDATE_BIN --date="$expiration_time_local_str" +%F)
+expiration_midnight_time_unix=$($GDATE_BIN --date="$expiration_date" +%s)
+current_time_local_str=$($GDATE_BIN) 
+current_time_unix=$($GDATE_BIN --date="$current_time_local_str" +%s)
+current_date=$($GDATE_BIN --date="$current_time_local_str" +%F)
+current_midnight_time_unix=$($GDATE_BIN --date="$current_date" +%s)
+seconds_to_expiration=$(($expiration_time_unix - $current_time_unix))
+seconds_midnight_to_midnight=$(($expiration_midnight_time_unix - $current_midnight_time_unix))
+days_to_expiration=$(($seconds_midnight_to_midnight / 86400))
+
+if [ $debug_mode = true ]; then 
+    echo "Debug:"
+    echo "  Expiration GMT time: $expiration_time_gmt_str"
+    echo "  Expiration Local time: $expiration_time_local_str"
+    echo "  Expiration unix time: $expiration_time_unix"
+    echo "  Expiration date: $expiration_date"
+    echo "  Expiration midnight unix time: $expiration_midnight_time_unix"
+    echo "  "
+    echo "  Current Local time: $current_time_local_str"
+    echo "  Current unix time: $current_time_unix"
+    echo "  Current date: $current_date"
+    echo "  Current midnight unix time: $current_midnight_time_unix"
+    echo "  "
+    echo "  Seconds until expiration: $seconds_to_expiration"
+    echo "  Seconds from midnight to midnight: $seconds_midnight_to_midnight"
+    echo "  Days until expiration: $days_to_expiration"
+    echo "  "
+fi
+
+if [ $seconds_to_expiration -le 0 ]; then
+    echo "Certificate $p12_file *EXPIRED* at $expiration_time_local_str"
+elif [ $days_to_expiration -eq 0 ]; then
+    echo "Certificate $p12_file *EXPIRES TODAY* at $expiration_time_local_str"
+elif [ $days_to_expiration -eq 1 ]; then
+    echo "Certificate $p12_file *EXPIRES TOMORROW* at $expiration_time_local_str"
+elif [ $days_to_expiration -lt 14 ]; then
+    echo "Certificate $p12_file *EXPIRES IN $days_to_expiration DAYS* on $expiration_time_local_str"
+else 
+    if [ "$quiet_mode" = false ]; then 
+        echo "Certificate $p12_file does not expire for another $days_to_expiration days on $expiration_time_local_str"
+    fi
+fi
+
+
